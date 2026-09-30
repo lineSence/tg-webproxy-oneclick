@@ -31,14 +31,14 @@ curl -fsSL https://raw.githubusercontent.com/lineSence/tg-webproxy-oneclick/main
 ## Команды
 
 ```bash
-sudo ./install.sh status      # сервисы, readyz, разрывы Middle-End
-sudo ./install.sh link        # показать ссылку и QR снова
-sudo ./install.sh update      # обновить relay из upstream
-sudo ./install.sh uninstall   # удалить всё
+sudo bash install.sh status      # сервисы, readyz, разрывы Middle-End
+sudo bash install.sh link        # показать ссылку и QR снова
+sudo bash install.sh update      # обновить relay из upstream
+sudo bash install.sh uninstall   # удалить всё
 ```
 
-Если вы запускали через `curl | bash`, замените `./install.sh` на
-`bash <(curl -fsSL https://raw.githubusercontent.com/lineSence/tg-webproxy-oneclick/main/install.sh)`.
+Если вы запускали через `curl | bash`, замените `install.sh` на
+`<(curl -fsSL https://raw.githubusercontent.com/lineSence/tg-webproxy-oneclick/main/install.sh)`, например: `sudo bash <(curl -fsSL https://raw.githubusercontent.com/lineSence/tg-webproxy-oneclick/main/install.sh) status`.
 
 ## Опции
 
