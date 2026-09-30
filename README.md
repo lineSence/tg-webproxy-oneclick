@@ -51,6 +51,7 @@ sudo bash install.sh uninstall   # удалить всё
 | `--site-dir DIR` | свой статический сайт вместо сгенерированного |
 | `--site-upstream URL` | свой сайт-приложение на loopback, например `http://127.0.0.1:3000` |
 | `--ref REF` | ветка, тег или коммит `tproxy-server` |
+| `--acme-forward HOST=PORT` | передать проверки Let's Encrypt (HTTP-01) для другого домена на этом сервере на `127.0.0.1:PORT`; можно указывать несколько раз |
 | `--workers N`, `--max-connections N` | параметры MTProxy |
 | `--skip-dns-check`, `--force`, `-y` | пропустить проверку DNS, игнорировать занятые порты, не задавать вопросов |
 
@@ -63,6 +64,33 @@ runcmd:
 ```
 
 Ссылку потом можно взять в `/root/tg-webproxy.txt`. Условие: A-запись должна появиться до первой загрузки сервера.
+
+## Рядом с Hysteria 2
+
+Hysteria работает по UDP 443, а Caddy — по TCP 80/443, поэтому они не мешают друг другу. Конфликт бывает только из-за TCP-слушателей Hysteria. Порты общие для всего сервера, поэтому отдельный поддомен не спасает.
+
+1. В `config.yaml` Hysteria перенесите проверку ACME на локальный порт:
+
+   ```yaml
+   acme:
+     domains: [hy.example.com]
+     email: you@example.com
+     listenHost: 127.0.0.1
+     type: http
+     http:
+       altPort: 8880
+   ```
+
+   Если в `masquerade` заданы `listenHTTP` или `listenHTTPS`, уберите их.
+2. Перезапустите Hysteria: `systemctl restart hysteria-server`.
+3. Установите прокси с пересылкой ACME:
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/lineSence/tg-webproxy-oneclick/main/install.sh \
+     | sudo bash -s -- --domain example.com --email you@example.com --acme-forward hy.example.com=8880
+   ```
+
+Caddy принимает проверки Let's Encrypt для `hy.example.com` на порту 80 и передаёт их Hysteria, поэтому её сертификат продолжит продлеваться.
 
 ## Клиенты
 
