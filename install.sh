@@ -10,7 +10,7 @@
 set -euo pipefail
 umask 077
 
-VERSION=0.1.0
+VERSION=0.2.0
 UPSTREAM_REPO="${TWP_UPSTREAM_REPO:-https://github.com/telegramdesktop/tproxy-server}"
 # Проверенный коммит upstream. Переопределяется --ref (ветка, тег или коммит).
 UPSTREAM_REF_DEFAULT=c8adb8b7c6b7fc46c12ae3acb68be9070c26a8e8
@@ -34,6 +34,8 @@ max_connections=4096
 skip_dns_check=
 force=
 assume_yes=
+acme_forwards=()
+FORWARDS_FILE=/etc/tg-webproxy/acme-forwards
 
 c_red=; c_green=; c_yellow=; c_bold=; c_reset=
 if [[ -t 1 ]]; then
@@ -61,6 +63,9 @@ tg-webproxy-oneclick $VERSION — Telegram WEB proxy одной командой
   --ref REF              ветка/тег/коммит tproxy-server (по умолчанию ${UPSTREAM_REF_DEFAULT:0:12})
   --workers N            воркеры MTProxy (по умолчанию 1)
   --max-connections N    соединений на воркер (по умолчанию 4096)
+  --acme-forward HOST=PORT  пересылать ACME HTTP-01 для другого домена на этом
+                         сервере (напр. Hysteria с acme.http.altPort) на 127.0.0.1:PORT;
+                         можно указывать несколько раз
   --skip-dns-check       не проверять, что домен указывает на этот сервер
   --force                продолжить, даже если порты 80/443 заняты другим ПО
   -y, --yes              не задавать вопросов
@@ -82,6 +87,7 @@ parse_args() {
 			--ref) ref="${2:-}"; shift 2 ;;
 			--workers) workers="${2:-}"; shift 2 ;;
 			--max-connections) max_connections="${2:-}"; shift 2 ;;
+			--acme-forward) acme_forwards+=("${2:-}"); shift 2 ;;
 			--skip-dns-check) skip_dns_check=1; shift ;;
 			--force) force=1; shift ;;
 			-y|--yes) assume_yes=1; shift ;;
@@ -142,6 +148,13 @@ validate_args() {
 	[[ "$workers" =~ ^[1-9][0-9]*$ ]] || die "--workers должно быть положительным числом"
 	[[ "$max_connections" =~ ^[1-9][0-9]*$ ]] || die "--max-connections должно быть положительным числом"
 	[[ -z "$site_dir" || -z "$site_upstream" ]] || die "--site-dir и --site-upstream взаимоисключающие"
+	local fwd
+	for fwd in "${acme_forwards[@]}"; do
+		[[ "$fwd" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?=[1-9][0-9]{0,4}$ ]] ||
+			die "--acme-forward ожидает HOST=PORT, получено: $fwd"
+		[[ "${fwd%%=*}" != "$domain" ]] || die "--acme-forward не может указывать на сам домен прокси"
+		case "${fwd#*=}" in 2398|8080|8081|8888) die "порт ${fwd#*=} занят компонентами прокси, выберите другой" ;; esac
+	done
 	if [[ -n "$site_dir" ]]; then
 		[[ -f "$site_dir/index.html" ]] || die "в $site_dir нет index.html"
 		site_dir="$(cd "$site_dir" && pwd -P)"
@@ -183,6 +196,10 @@ check_ports() {
 	for port in 80 443; do
 		owners="$(ss -Hltnp "sport = :$port" 2>/dev/null | grep -o 'users:(("[^"]*"' | cut -d'"' -f2 | sort -u | tr '\n' ' ')"
 		[[ -z "$owners" || "$owners" == "caddy " ]] && continue
+		if [[ "$owners" == *hysteria* ]]; then
+			hysteria_hint "$port"
+			[[ -n "$force" ]] || die "порт $port занят Hysteria"
+		fi
 		if [[ -n "$force" ]]; then
 			warn "порт $port занят: $owners(--force, продолжаем)"
 		else
@@ -193,6 +210,60 @@ check_ports() {
 		warn "существующий /etc/caddy/Caddyfile будет сохранён в резервную копию и заменён"
 		confirm "Продолжить?" || die "отменено"
 	fi
+}
+
+hysteria_hint() {
+	cat >&2 <<HINT
+${c_yellow}[!]${c_reset} TCP-порт $1 занят Hysteria. Порты общие для всего сервера, поддомен не помогает.
+    Hysteria (QUIC) использует UDP 443 и с Caddy (TCP 80/443) не конфликтует — нужно
+    только убрать её TCP-слушатели:
+
+    1) В config.yaml Hysteria перенесите ACME HTTP-01 на локальный порт:
+         acme:
+           listenHost: 127.0.0.1
+           type: http
+           http:
+             altPort: 8880
+    2) Уберите masquerade.listenHTTP / listenHTTPS (TCP 80/443), если они есть.
+    3) systemctl restart hysteria-server   # имя сервиса может отличаться
+    4) Запустите установку с пересылкой ACME для домена Hysteria:
+         ... --acme-forward ИМЯ.ДОМЕНА.HYSTERIA=8880
+       Caddy будет принимать проверки Let's Encrypt на :80 и отдавать их Hysteria,
+       так что её сертификат продолжит продлеваться.
+HINT
+}
+
+apply_acme_forwards() {
+	if [[ ${#acme_forwards[@]} -eq 0 && -f "$FORWARDS_FILE" ]]; then
+		mapfile -t acme_forwards <"$FORWARDS_FILE"
+	fi
+	[[ ${#acme_forwards[@]} -gt 0 ]] || return 0
+	local fwd host port
+	install -d -m 0755 /etc/tg-webproxy
+	printf '%s\n' "${acme_forwards[@]}" >"$FORWARDS_FILE"
+	{
+		echo
+		echo "# tg-webproxy-oneclick: ACME HTTP-01 для других сервисов на этом сервере"
+		for fwd in "${acme_forwards[@]}"; do
+			host="${fwd%%=*}"; port="${fwd#*=}"
+			cat <<CADDY
+http://$host {
+	handle /.well-known/acme-challenge/* {
+		reverse_proxy 127.0.0.1:$port
+	}
+	handle {
+		respond 404
+	}
+}
+CADDY
+		done
+	} >>/etc/caddy/Caddyfile
+	TPROXY_HOSTNAME="$domain" TPROXY_SITE_ROOT="$SITE_ROOT" ACME_EMAIL="$email" \
+		/usr/local/bin/caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
+	systemctl restart caddy.service
+	for fwd in "${acme_forwards[@]}"; do
+		info "ACME HTTP-01 для ${fwd%%=*} -> 127.0.0.1:${fwd#*=}"
+	done
 }
 
 resolve_secret() {
@@ -416,7 +487,7 @@ cmd_uninstall() {
 	rm -rf /etc/systemd/system/caddy.service.d
 	systemctl daemon-reload
 	rm -f /usr/local/bin/tproxy-server* /usr/local/bin/caddy /usr/local/sbin/refresh-mtproxy-config
-	rm -rf /etc/tproxy-server /etc/mtproxy /opt/MTProxy "$SRC_DIR" "$STATE_FILE"
+	rm -rf /etc/tg-webproxy /etc/tproxy-server /etc/mtproxy /opt/MTProxy "$SRC_DIR" "$STATE_FILE"
 	if confirm "Удалить также сайт-прикрытие $SITE_ROOT и данные Caddy (сертификаты)?"; then
 		rm -rf "$SITE_ROOT" /var/lib/caddy /etc/caddy
 	fi
@@ -429,7 +500,7 @@ main() {
 		install)
 			require_root; preflight; validate_args; install_prereqs
 			check_dns; check_ports; resolve_secret; fetch_upstream
-			run_upstream_installer; save_and_print
+			run_upstream_installer; apply_acme_forwards; save_and_print
 			cmd_status || warn "не все проверки прошли, см. вывод выше" ;;
 		status) require_root; cmd_status ;;
 		link) require_root; print_link ;;
